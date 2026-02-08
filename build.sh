@@ -104,17 +104,17 @@ curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kern
 # 下载 SUSFS 补丁 (兼容 4.19)
 wget https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.19.patch -O susfs.patch -q
 
-# ==================== [Step 3: SukiSU-Ultra 全量 Hook 注入 (7项完美版)] ====================
+# ==================== [Step 3: SukiSU-Ultra 全量 Hook 注入 (严格源码适配版)] ====================
 # 定义颜色
 R='\033[0;31m'
 G='\033[0;32m'
 B='\033[0;34m'
 N='\033[0m'
 
-echo -e "${B}🔧 [3/5] 正在执行 SukiSU-Ultra 全量 Hook 注入 (含 SUSFS 补丁)...${N}"
+echo -e "${B}🔧 [3/5] 正在执行 SukiSU-Ultra 全量 Hook 注入...${N}"
 
 # -------------------------------------------------------------------------
-# [0.1] 应用 SUSFS 补丁 (你的新增代码)
+# [0.1] 应用 SUSFS 补丁 (保留你的代码)
 # -------------------------------------------------------------------------
 if [ -f "susfs.patch" ]; then
     echo -e "${B}   -> [补丁] 正在应用 SUSFS 补丁...${N}"
@@ -128,7 +128,7 @@ if [ -f "susfs.patch" ]; then
 fi
 
 # -------------------------------------------------------------------------
-# [0.2] 补全头文件 (SUSFS 需要 - 你的新增代码)
+# [0.2] 补全头文件 (SUSFS 需要 - 保留你的代码)
 # -------------------------------------------------------------------------
 # 1. sched.h: 添加 susfs_task_state 字段
 if ! grep -q "susfs_task_state" include/linux/sched.h; then
@@ -147,7 +147,7 @@ if ! grep -q "INODE_STATE_SUS_KSTAT" include/linux/fs.h; then
 fi
 
 # -------------------------------------------------------------------------
-# [0.3] 预处理：防止 4.19 内核语法报错
+# [0.3] 预处理：防止 4.19 内核语法报错 (保留你的代码)
 # -------------------------------------------------------------------------
 # SukiSU 源码包含 C99 语法，必须禁用 strict-prototypes 和 declaration-after-statement 警告
 for makefile in "fs/Makefile" "drivers/input/Makefile" "security/selinux/Makefile" "kernel/Makefile"; do
@@ -161,18 +161,21 @@ for makefile in "fs/Makefile" "drivers/input/Makefile" "security/selinux/Makefil
     fi
 done
 
+# ==================== [下面是 7 个核心 Hook - 已严格匹配源码签名] ====================
+
 # -------------------------------------------------------------------------
-# [1. Exec Hook] (核心 Root 权限)
+# [1. Exec Hook] (Root 核心)
 # -------------------------------------------------------------------------
+# 源码对应: sucompat.c -> int ksu_handle_execveat(...)
+# 必须传递 &filename, &argv, &envp (指针的指针)
 target_file="fs/exec.c"
 if [ -f "$target_file" ]; then
-    echo -ne "   -> [1/7] Hooking fs/exec.c ... "
+    echo -ne "   -> [1/7] Hooking fs/exec.c (ROOT核心) ... "
     sed -i '/#include <linux\/file.h>/a \
 #ifdef CONFIG_KSU\
 extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\
 #endif' "$target_file"
 
-    # 注入到 do_execveat_common
     sed -i '/return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);/i \
 #ifdef CONFIG_KSU\
 \tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\
@@ -185,6 +188,7 @@ fi
 # -------------------------------------------------------------------------
 # [2. Input Hook] (安全模式/救砖)
 # -------------------------------------------------------------------------
+# 源码对应: ksud.c -> int ksu_handle_input_handle_event(...)
 target_file="drivers/input/input.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [2/7] Hooking drivers/input/input.c ... "
@@ -194,7 +198,6 @@ extern bool ksu_input_hook __read_mostly;\
 extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\
 #endif' "$target_file"
 
-    # 在 spin_lock 之前注入
     sed -i '/if (is_event_supported(type, dev->evbit, EV_MAX))/i \
 #ifdef CONFIG_KSU\
 \tif (unlikely(ksu_input_hook))\
@@ -204,55 +207,48 @@ extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code,
 fi
 
 # -------------------------------------------------------------------------
-# [3. Read Hook] (状态检测)
+# [3. Read Hook] (自启动检测 - 重点修正！)
 # -------------------------------------------------------------------------
+# 源码对应: ksud.c -> void ksu_handle_sys_read(unsigned int fd)
+# ⚠️ 绝对不能传 buf 和 count，也不能接收返回值，否则 init.rc 读取无法被拦截
 target_file="fs/read_write.c"
 if [ -f "$target_file" ]; then
-    echo -ne "   -> [3/7] Hooking fs/read_write.c ... "
+    echo -ne "   -> [3/7] Hooking fs/read_write.c (已修正为void参数) ... "
     sed -i '/#include <linux\/fs.h>/a \
 #ifdef CONFIG_KSU\
 extern bool ksu_init_rc_hook __read_mostly;\
-extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\
+extern void ksu_handle_sys_read(unsigned int fd);\
 #endif' "$target_file"
 
-    # 注入到 read 系统调用入口
-    sed -i '/^SYSCALL_DEFINE3(read,/,/^{/ s/^{/{ \n#ifdef CONFIG_KSU\n\tif (unlikely(ksu_init_rc_hook))\n\t\tksu_handle_sys_read(fd, \&buf, \&count);\n#endif/' "$target_file"
+    # 正确调用: 只有 fd
+    sed -i '/^SYSCALL_DEFINE3(read,/,/^{/ s/^{/{ \n#ifdef CONFIG_KSU\n\tif (unlikely(ksu_init_rc_hook))\n\t\tksu_handle_sys_read(fd);\n#endif/' "$target_file"
     echo -e "${G}OK${N}"
 fi
 
 # -------------------------------------------------------------------------
-# [4. Stat Hook] (增强版隐藏 - 全量适配)
+# [4. Stat Hook] (隐藏 - 重点修正！)
 # -------------------------------------------------------------------------
+# 源码对应: sucompat.c -> int ksu_handle_stat(...)
+# ⚠️ SukiSU-Ultra 没有导出 newfstat/fstat64，强制注入会导致 undefined reference
 target_file="fs/stat.c"
 if [ -f "$target_file" ]; then
-    echo -ne "   -> [4/7] Hooking fs/stat.c (增强版) ... "
-    # 注入声明
+    echo -ne "   -> [4/7] Hooking fs/stat.c (仅保留 vfs_fstatat) ... "
     sed -i '/#include <linux\/fs.h>/a \
 #ifdef CONFIG_KSU\
 extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\
-extern int ksu_handle_newfstat_ret(unsigned int fd, struct kstat *stat);\
-extern int ksu_handle_fstat64_ret(unsigned int fd, struct kstat *stat);\
 #endif' "$target_file"
 
-    # 1. Hook vfs_fstatat
     sed -i '/error = vfs_fstatat(dfd, filename, &stat, flag);/i \
 #ifdef CONFIG_KSU\
 \tksu_handle_stat(\&dfd, \&filename, \&flag);\
 #endif' "$target_file"
-
-    # 2. Hook newfstat
-    sed -i '/^SYSCALL_DEFINE2(newfstat,/,/^}/ s/return cp_new_stat(&stat, statbuf);/#ifdef CONFIG_KSU\n\terror = cp_new_stat(\&stat, statbuf);\n\tif (!error) ksu_handle_newfstat_ret(fd, \&stat);\n\treturn error;\n#else\n\treturn cp_new_stat(\&stat, statbuf);\n#endif/' "$target_file"
-
-    # 3. Hook fstat64
-    if grep -q "cp_new_stat64" "$target_file"; then
-        sed -i '/^SYSCALL_DEFINE2(fstat64,/,/^}/ s/return cp_new_stat64(&stat, statbuf);/#ifdef CONFIG_KSU\n\terror = cp_new_stat64(\&stat, statbuf);\n\tif (!error) ksu_handle_fstat64_ret(fd, \&stat);\n\treturn error;\n#else\n\treturn cp_new_stat64(\&stat, statbuf);\n#endif/' "$target_file"
-    fi
     echo -e "${G}OK${N}"
 fi
 
 # -------------------------------------------------------------------------
 # [5. Open Hook] (访问控制)
 # -------------------------------------------------------------------------
+# 源码对应: sucompat.c -> int ksu_handle_faccessat(...)
 target_file="fs/open.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [5/7] Hooking fs/open.c ... "
@@ -269,8 +265,9 @@ extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int
 fi
 
 # -------------------------------------------------------------------------
-# [6. Setuid Hook] (权限切换监控)
+# [6. Setuid Hook] (权限切换)
 # -------------------------------------------------------------------------
+# 源码对应: setuid_hook.c -> int ksu_handle_setresuid(...)
 target_file="kernel/sys.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [6/7] Hooking kernel/sys.c ... "
@@ -286,8 +283,9 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# [7. Reboot Hook] (清理挂载点)
+# [7. Reboot Hook] (卸载挂载点)
 # -------------------------------------------------------------------------
+# 源码对应: supercalls.c -> int ksu_handle_sys_reboot(...)
 target_file="kernel/reboot.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [7/7] Hooking kernel/reboot.c ... "
@@ -302,7 +300,8 @@ else
     echo -e "${R}⚠️ 警告: kernel/reboot.c 未找到，跳过 Reboot Hook${N}"
 fi
 
-echo -e "${G}🎉 SukiSU-Ultra 全量 Hook (7项 + SUSFS补丁) 注入完成！${N}"
+echo -e "${G}🎉 SukiSU-Ultra 全量 Hook 注入完成！(已根据源码 ksud.c/sucompat.c 严格校对签名)${N}"
+
 
 # ==================== [Step 3.5: 变量桥接与链接修复 (修复版)] ====================
 echo "🔧 [3.5/6] 正在执行变量桥接与冲突修复..."
