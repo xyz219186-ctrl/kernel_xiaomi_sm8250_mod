@@ -1,0 +1,50 @@
+name: Build Alioth Kernel (Only KSU/SUSFS)
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y build-essential git curl wget bison flex zip bc cpio libssl-dev ccache python-is-python3 tar
+    - name: Setup zyc-clang toolchain
+      run: |
+        mkdir -p $HOME/zyc-clang
+        cd $HOME/zyc-clang
+        wget https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20251111-release/Clang-15.0.7-20251111.tar.gz
+        tar -zxvf Clang-15.0.7-20251111.tar.gz
+        cd $GITHUB_WORKSPACE
+    # 赋予脚本执行权限 (防止 Permission denied)
+    - name: Make script executable
+      run: chmod +x build.sh
+
+    # 新增：把 build.sh 的修改提交到本地工作树（避免脚本检测到脏工作树）
+    - name: Commit build.sh if changed
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add build.sh || true
+        git commit -m "Make build.sh executable / add build script" || echo "no changes to commit"
+    # 编译 Alioth
+    - name: Build kernel for Alioth
+      run: |
+        bash build.sh alioth
+    # 上传产物 (通配符版 - 专治文件名不匹配)
+    - name: Upload zip
+      uses: actions/upload-artifact@v4
+      with:
+        # name 是在网页上显示的下载按钮名字，可以随便起，不影响文件
+        name: Kernel_Alioth_Build_Result
+        # path 是关键！改成 Kernel*.zip 表示只要是以 Kernel 开头的 zip 包全部上传
+        # 或者干脆改成 *.zip 也可以
+        path: Kernel*.zip
+        # 如果您担心找不到文件报错，可以加上这个参数让它别报错
+        if-no-files-found: warn
