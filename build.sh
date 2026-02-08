@@ -97,7 +97,7 @@ fi
 echo "   ✅ 深度净化完成！"
 
 # ==================== [Step 2: 下载组件 (SukiSU 官方源)] ====================
-echo "⬇️ [2/6] 下载 ReSukiSU & SUSFS..."
+echo "⬇️ [2/6] 下载 SukiSU & SUSFS..."
 # 使用 SukiSU 官方 setup.sh
 curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
 
@@ -111,9 +111,44 @@ G='\033[0;32m'
 B='\033[0;34m'
 N='\033[0m'
 
-echo -e "${B}🔧 [3/5] 正在执行 SukiSU-Ultra 全量 Hook 注入 (7项完美适配)...${N}"
+echo -e "${B}🔧 [3/5] 正在执行 SukiSU-Ultra 全量 Hook 注入 (含 SUSFS 补丁)...${N}"
 
-# --- [0. 预处理]：防止 4.19 内核语法报错 ---
+# -------------------------------------------------------------------------
+# [0.1] 应用 SUSFS 补丁 (你的新增代码)
+# -------------------------------------------------------------------------
+if [ -f "susfs.patch" ]; then
+    echo -e "${B}   -> [补丁] 正在应用 SUSFS 补丁...${N}"
+    # 使用 fuzz=3 和 -N (忽略反向补丁) 提高成功率
+    patch -p1 --ignore-whitespace --fuzz=3 -N < susfs.patch >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo -e "${G}      ✅ SUSFS 补丁应用成功${N}"
+    else
+        echo -e "${Y}      ⚠️ SUSFS 补丁可能已应用或有冲突 (尝试跳过)${N}"
+    fi
+fi
+
+# -------------------------------------------------------------------------
+# [0.2] 补全头文件 (SUSFS 需要 - 你的新增代码)
+# -------------------------------------------------------------------------
+# 1. sched.h: 添加 susfs_task_state 字段
+if ! grep -q "susfs_task_state" include/linux/sched.h; then
+    sed -i '/^	\/\* protection of the PI data mutex \*\//i \
+	#ifdef CONFIG_KSU\
+	u32 susfs_task_state;\
+	#endif' include/linux/sched.h
+fi
+
+# 2. fs.h: 添加 INODE_STATE_SUS_KSTAT 定义
+if ! grep -q "INODE_STATE_SUS_KSTAT" include/linux/fs.h; then
+    sed -i '$a \
+#ifndef INODE_STATE_SUS_KSTAT\
+#define INODE_STATE_SUS_KSTAT (1UL << 30)\
+#endif' include/linux/fs.h
+fi
+
+# -------------------------------------------------------------------------
+# [0.3] 预处理：防止 4.19 内核语法报错
+# -------------------------------------------------------------------------
 # SukiSU 源码包含 C99 语法，必须禁用 strict-prototypes 和 declaration-after-statement 警告
 for makefile in "fs/Makefile" "drivers/input/Makefile" "security/selinux/Makefile" "kernel/Makefile"; do
     if [ -f "$makefile" ]; then
@@ -126,8 +161,9 @@ for makefile in "fs/Makefile" "drivers/input/Makefile" "security/selinux/Makefil
     fi
 done
 
-# --- [1. Exec Hook] (核心 Root 权限) ---
-# 负责拦截 execve 系统调用，授予 Root 权限
+# -------------------------------------------------------------------------
+# [1. Exec Hook] (核心 Root 权限)
+# -------------------------------------------------------------------------
 target_file="fs/exec.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [1/7] Hooking fs/exec.c ... "
@@ -146,8 +182,9 @@ else
     echo -e "${R}❌ 失败: 找不到 fs/exec.c${N}"; exit 1
 fi
 
-# --- [2. Input Hook] (安全模式/救砖) ---
-# 负责检测音量键长按，进入安全模式禁用模块
+# -------------------------------------------------------------------------
+# [2. Input Hook] (安全模式/救砖)
+# -------------------------------------------------------------------------
 target_file="drivers/input/input.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [2/7] Hooking drivers/input/input.c ... "
@@ -157,7 +194,7 @@ extern bool ksu_input_hook __read_mostly;\
 extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\
 #endif' "$target_file"
 
-    # 在 spin_lock 之前注入，确保响应最快
+    # 在 spin_lock 之前注入
     sed -i '/if (is_event_supported(type, dev->evbit, EV_MAX))/i \
 #ifdef CONFIG_KSU\
 \tif (unlikely(ksu_input_hook))\
@@ -166,8 +203,9 @@ extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code,
     echo -e "${G}OK${N}"
 fi
 
-# --- [3. Read Hook] (状态检测) ---
-# 负责管理器识别内核模块状态，以及 fastboot 模式检测
+# -------------------------------------------------------------------------
+# [3. Read Hook] (状态检测)
+# -------------------------------------------------------------------------
 target_file="fs/read_write.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [3/7] Hooking fs/read_write.c ... "
@@ -182,8 +220,9 @@ extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *c
     echo -e "${G}OK${N}"
 fi
 
-# --- [4. Stat Hook] (增强版隐藏) ---
-# 负责隐藏 /sys/fs/cgroup 等敏感路径，这里采用了全量 Hook (包含 fstat64 兼容 32 位应用)
+# -------------------------------------------------------------------------
+# [4. Stat Hook] (增强版隐藏 - 全量适配)
+# -------------------------------------------------------------------------
 target_file="fs/stat.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [4/7] Hooking fs/stat.c (增强版) ... "
@@ -195,25 +234,25 @@ extern int ksu_handle_newfstat_ret(unsigned int fd, struct kstat *stat);\
 extern int ksu_handle_fstat64_ret(unsigned int fd, struct kstat *stat);\
 #endif' "$target_file"
 
-    # 1. Hook vfs_fstatat (基础隐藏)
+    # 1. Hook vfs_fstatat
     sed -i '/error = vfs_fstatat(dfd, filename, &stat, flag);/i \
 #ifdef CONFIG_KSU\
 \tksu_handle_stat(\&dfd, \&filename, \&flag);\
 #endif' "$target_file"
 
-    # 2. Hook newfstat (修复部分应用检测)
-    # 注意：这里使用替换逻辑，确保 error 变量作用域正确
+    # 2. Hook newfstat
     sed -i '/^SYSCALL_DEFINE2(newfstat,/,/^}/ s/return cp_new_stat(&stat, statbuf);/#ifdef CONFIG_KSU\n\terror = cp_new_stat(\&stat, statbuf);\n\tif (!error) ksu_handle_newfstat_ret(fd, \&stat);\n\treturn error;\n#else\n\treturn cp_new_stat(\&stat, statbuf);\n#endif/' "$target_file"
 
-    # 3. Hook fstat64 (兼容 32 位旧应用)
+    # 3. Hook fstat64
     if grep -q "cp_new_stat64" "$target_file"; then
         sed -i '/^SYSCALL_DEFINE2(fstat64,/,/^}/ s/return cp_new_stat64(&stat, statbuf);/#ifdef CONFIG_KSU\n\terror = cp_new_stat64(\&stat, statbuf);\n\tif (!error) ksu_handle_fstat64_ret(fd, \&stat);\n\treturn error;\n#else\n\treturn cp_new_stat64(\&stat, statbuf);\n#endif/' "$target_file"
     fi
     echo -e "${G}OK${N}"
 fi
 
-# --- [5. Open Hook] (访问控制) ---
-# 拦截 faccessat，防止敏感文件被检测
+# -------------------------------------------------------------------------
+# [5. Open Hook] (访问控制)
+# -------------------------------------------------------------------------
 target_file="fs/open.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [5/7] Hooking fs/open.c ... "
@@ -229,8 +268,9 @@ extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int
     echo -e "${G}OK${N}"
 fi
 
-# --- [6. Setuid Hook] (权限切换监控) ---
-# 虽然 4.19+ 可以自动处理，但手动 Hook 更稳，防止 su 切换 UID 时被内核安全机制拦截
+# -------------------------------------------------------------------------
+# [6. Setuid Hook] (权限切换监控)
+# -------------------------------------------------------------------------
 target_file="kernel/sys.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [6/7] Hooking kernel/sys.c ... "
@@ -239,15 +279,15 @@ if [ -f "$target_file" ]; then
 extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\
 #endif' "$target_file"
 
-    # 注入到 setresuid 系统调用
     sed -i '/long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)/,/{/ s/{/{ \n#ifdef CONFIG_KSU\n\t(void)ksu_handle_setresuid(ruid, euid, suid);\n#endif/' "$target_file"
     echo -e "${G}OK${N}"
 else
     echo -e "${R}⚠️ 警告: kernel/sys.c 未找到，跳过 Setuid Hook${N}"
 fi
 
-# --- [7. Reboot Hook] (清理挂载点) ---
-# 确保重启时 SukiSU 能够正确卸载 OverlayFS 挂载点，防止死锁或文件损坏
+# -------------------------------------------------------------------------
+# [7. Reboot Hook] (清理挂载点)
+# -------------------------------------------------------------------------
 target_file="kernel/reboot.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [7/7] Hooking kernel/reboot.c ... "
@@ -256,14 +296,13 @@ if [ -f "$target_file" ]; then
 extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\
 #endif' "$target_file"
 
-    # 注入到 reboot 系统调用
     sed -i '/SYSCALL_DEFINE4(reboot,/,/^{/ s/^{/{ \n#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, \&arg);\n#endif/' "$target_file"
     echo -e "${G}OK${N}"
 else
     echo -e "${R}⚠️ 警告: kernel/reboot.c 未找到，跳过 Reboot Hook${N}"
 fi
 
-echo -e "${G}🎉 SukiSU-Ultra 全量 Hook (7项) 注入完成！适配度：100%${N}"
+echo -e "${G}🎉 SukiSU-Ultra 全量 Hook (7项 + SUSFS补丁) 注入完成！${N}"
 
 # ==================== [Step 3.5: 变量桥接与链接修复 (修复版)] ====================
 echo "🔧 [3.5/6] 正在执行变量桥接与冲突修复..."
