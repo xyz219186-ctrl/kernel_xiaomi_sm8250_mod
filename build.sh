@@ -303,90 +303,74 @@ fi
 echo -e "${G}🎉 SukiSU-Ultra 全量 Hook 注入完成！(已根据源码 ksud.c/sucompat.c 严格校对签名)${N}"
 
 
-# ==================== [Step 3.5: 变量桥接与链接修复 (4.19 终极修正版)] ====================
-echo -e "\033[0;34m🔧 [3.5/6] 正在执行变量桥接与冲突修复...\033[0m"
+# ==================== [Step 3.5: SukiSU 逻辑深度适配 (安全修正版)] ====================
+echo -e "\033[0;34m🔧 [3.5/6] 正在执行 SukiSU 逻辑深度适配 (参考 ReSukiSU 方案)...\033[0m"
 
-# 1. 强制 drivers/Makefile 包含 kernelsu (确保 SukiSU 参与编译)
+# 1. 强制 drivers/Makefile 包含 kernelsu (必须有)
 DRIVERS_MAKEFILE="drivers/Makefile"
 if [ -f "$DRIVERS_MAKEFILE" ]; then
     sed -i '/kernelsu/d' "$DRIVERS_MAKEFILE"
     echo "obj-y += kernelsu/" >> "$DRIVERS_MAKEFILE"
 fi
 
-# 2. 桥接 Policydb (解决 undefined reference to ksu_policydb_ptr)
-SERVICES_FILE="security/selinux/ss/services.c"
-if [ -f "$SERVICES_FILE" ]; then
-    grep -q "linux/export.h" "$SERVICES_FILE" || sed -i '/#include <linux\/kernel.h>/a #include <linux/export.h>' "$SERVICES_FILE"
-    
-    if ! grep -q "ksu_policydb_ptr" "$SERVICES_FILE"; then
-        cat >> "$SERVICES_FILE" <<EOF
-
-struct policydb *ksu_policydb_ptr = &selinux_ss.policydb;
-EXPORT_SYMBOL(ksu_policydb_ptr);
-EOF
-    fi
+# 2. 移除 susfs 编译指令 (防止 No rule 报错)
+# 既然你不需要编译 susfs 源码，就必须把这一行干掉
+if [ -f "drivers/Makefile" ]; then
+    sed -i '/susfs/d' "drivers/Makefile"
+fi
+if [ -f "fs/Makefile" ]; then
+    sed -i '/susfs/d' "fs/Makefile"
 fi
 
-# 3. 桥接 AVC 并导出函数 (解决 Error 2 和 链接错误)
-AVC_FILE="security/selinux/avc.c"
-if [ -f "$AVC_FILE" ]; then
-    grep -q "linux/export.h" "$AVC_FILE" || sed -i '/#include <linux\/types.h>/a #include <linux/export.h>' "$AVC_FILE"
-    
-    # 3.1 导出结构体指针 (SukiSU 可能需要)
-    if ! grep -q "ksu_selinux_avc_ptr" "$AVC_FILE"; then
-        cat >> "$AVC_FILE" <<EOF
-
-struct selinux_avc *ksu_selinux_avc_ptr = &selinux_avc;
-EXPORT_SYMBOL(ksu_selinux_avc_ptr);
-EOF
-    fi
-
-    # 3.2 【核心修正】导出 avc_ss_reset
-    # 4.19 内核必须导出这个函数，SukiSU 才能调用它刷新缓存
-    if ! grep -q "EXPORT_SYMBOL(avc_ss_reset)" "$AVC_FILE"; then
-        echo "EXPORT_SYMBOL(avc_ss_reset);" >> "$AVC_FILE"
-    fi
-fi
-
-# 4. 适配 rules.c (修复参数冲突)
+# 3. 深度修正 rules.c (核心逻辑)
 RULES_FILE="drivers/kernelsu/selinux/rules.c"
 if [ -f "$RULES_FILE" ]; then
-    echo "   -> 修复 drivers/kernelsu/selinux/rules.c ..."
+    echo "   -> 正在修正 SukiSU rules.c (注入兼容代码)..."
+
+    # [操作 A] 重写 get_policydb 函数
+    # 原理：参考 ReSukiSU，直接引用内核全局变量 policydb，绕过 selinux_state 检查
     
-    # 4.1 替换 get_policydb 实现 (使用我们导出的指针)
-    if grep -q "static struct policydb \*get_policydb(void)" "$RULES_FILE"; then
-       sed -i '/static struct policydb \*get_policydb(void)/,/^}/c\
-extern struct policydb *ksu_policydb_ptr;\
+    # 1. 先声明外部变量 (插在头部 include 之后)
+    sed -i '/#include "xfrm.h"/a \\n/* KSU_COMPAT: 4.19 Kernel Adaption */\nextern struct policydb policydb;' "$RULES_FILE"
+
+    # 2. 删除旧的 get_policydb 函数体 (利用 sed 区间删除)
+    sed -i '/static struct policydb \*get_policydb(void)/,/^}/d' "$RULES_FILE"
+
+    # 3. 注入新的 get_policydb 实现 (最简易版)
+    sed -i '/#define ALL NULL/a \
 static struct policydb *get_policydb(void)\
 {\
-    return ksu_policydb_ptr;\
+    return &policydb;\
 }' "$RULES_FILE"
-    fi
+
+    # [操作 B] 重写 reset_avc_cache 函数
+    # 原理：ReSukiSU 逻辑，强制使用单参数调用，防止 Error 2
     
-    # 4.2 【致命错误修复】强制使用 1 个参数调用 avc_ss_reset
-    # 这就是你之前报错的原因！
-    # 这里我们强制声明为 1 个参数 (u32 seqno)，并传入 0，完全符合 4.19 内核定义。
-    if grep -q "static void reset_avc_cache(void)" "$RULES_FILE"; then
-        sed -i '/static void reset_avc_cache(void)/,/^}/c\
-extern int avc_ss_reset(u32 seqno);\
+    # 1. 删除旧的声明 (avc_ss_reset)
+    sed -i '/extern int avc_ss_reset/d' "$RULES_FILE"
+    
+    # 2. 注入正确声明 (单参数)
+    sed -i '/static int get_object/i \
+/* KSU_COMPAT: Force single argument for 4.19 */\
+extern int avc_ss_reset(u32 seqno);' "$RULES_FILE"
+
+    # 3. 删除旧的 reset_avc_cache 函数体
+    sed -i '/static void reset_avc_cache(void)/,/^}/d' "$RULES_FILE"
+
+    # 4. 注入新的 reset_avc_cache 实现
+    # 注意：这里我们直接用 0 作为参数，且保留 selinux_xfrm_notify_policyload
+    sed -i '/extern int avc_ss_reset(u32 seqno);/a \
 static void reset_avc_cache(void)\
 {\
     avc_ss_reset(0);\
     selnl_notify_policyload(0);\
     selinux_xfrm_notify_policyload();\
 }' "$RULES_FILE"
-    fi
+
+    echo "      -> rules.c 适配完成 (已重写关键函数)"
 fi
 
-# 5. 确保 SUSFS 被编译 (补丁打了但可能没开编译)
-if [ -f "drivers/Makefile" ] && ! grep -q "susfs" "drivers/Makefile"; then
-    echo "obj-\$(CONFIG_KSU_SUSFS) += susfs/" >> "drivers/Makefile"
-fi
-if [ -f "fs/Makefile" ] && ! grep -q "susfs" "fs/Makefile"; then
-    echo "obj-\$(CONFIG_KSU_SUSFS) += susfs/" >> "fs/Makefile"
-fi
-
-echo -e "\033[0;32m✅ 桥接与修复完成！(已修正为 4.19 单参数模式)\033[0m"
+echo -e "\033[0;32m✅ SukiSU 逻辑适配完成！(无内核侵入)\033[0m"
 
 # ==================== [Step 4: SukiSU 源码适配] ====================
 echo "💉 [4/6] 执行 SukiSU 源码编译适配..."
