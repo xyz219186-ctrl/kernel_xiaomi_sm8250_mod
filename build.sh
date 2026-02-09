@@ -161,18 +161,18 @@ for makefile in "fs/Makefile" "drivers/input/Makefile" "security/selinux/Makefil
     fi
 done
 
-# ==================== [下面是 7 个核心 Hook - 已严格匹配源码签名] ====================
+# ==================== [7 个核心 Hook - 完整保留] ====================
 
 # -------------------------------------------------------------------------
-# [1. Exec Hook] (Root 核心)
+# [1. Exec Hook] (Root 核心 - 唯一修改点)
 # -------------------------------------------------------------------------
-# 源码对应: sucompat.c -> int ksu_handle_execveat(...)
-# 必须传递 &filename, &argv, &envp (指针的指针)
+# 修改说明: 添加 "struct filename;" 前置声明，修复 "declaration not visible" 报错
 target_file="fs/exec.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [1/7] Hooking fs/exec.c (ROOT核心) ... "
     sed -i '/#include <linux\/file.h>/a \
 #ifdef CONFIG_KSU\
+struct filename;\
 extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\
 #endif' "$target_file"
 
@@ -186,9 +186,8 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# [2. Input Hook] (安全模式/救砖)
+# [2. Input Hook] (安全模式)
 # -------------------------------------------------------------------------
-# 源码对应: ksud.c -> int ksu_handle_input_handle_event(...)
 target_file="drivers/input/input.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [2/7] Hooking drivers/input/input.c ... "
@@ -207,32 +206,27 @@ extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code,
 fi
 
 # -------------------------------------------------------------------------
-# [3. Read Hook] (自启动检测 - 重点修正！)
+# [3. Read Hook] (自启动检测)
 # -------------------------------------------------------------------------
-# 源码对应: ksud.c -> void ksu_handle_sys_read(unsigned int fd)
-# ⚠️ 绝对不能传 buf 和 count，也不能接收返回值，否则 init.rc 读取无法被拦截
 target_file="fs/read_write.c"
 if [ -f "$target_file" ]; then
-    echo -ne "   -> [3/7] Hooking fs/read_write.c (已修正为void参数) ... "
+    echo -ne "   -> [3/7] Hooking fs/read_write.c ... "
     sed -i '/#include <linux\/fs.h>/a \
 #ifdef CONFIG_KSU\
 extern bool ksu_init_rc_hook __read_mostly;\
 extern void ksu_handle_sys_read(unsigned int fd);\
 #endif' "$target_file"
 
-    # 正确调用: 只有 fd
     sed -i '/^SYSCALL_DEFINE3(read,/,/^{/ s/^{/{ \n#ifdef CONFIG_KSU\n\tif (unlikely(ksu_init_rc_hook))\n\t\tksu_handle_sys_read(fd);\n#endif/' "$target_file"
     echo -e "${G}OK${N}"
 fi
 
 # -------------------------------------------------------------------------
-# [4. Stat Hook] (隐藏 - 重点修正！)
+# [4. Stat Hook] (隐藏)
 # -------------------------------------------------------------------------
-# 源码对应: sucompat.c -> int ksu_handle_stat(...)
-# ⚠️ SukiSU-Ultra 没有导出 newfstat/fstat64，强制注入会导致 undefined reference
 target_file="fs/stat.c"
 if [ -f "$target_file" ]; then
-    echo -ne "   -> [4/7] Hooking fs/stat.c (仅保留 vfs_fstatat) ... "
+    echo -ne "   -> [4/7] Hooking fs/stat.c ... "
     sed -i '/#include <linux\/fs.h>/a \
 #ifdef CONFIG_KSU\
 extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\
@@ -248,7 +242,6 @@ fi
 # -------------------------------------------------------------------------
 # [5. Open Hook] (访问控制)
 # -------------------------------------------------------------------------
-# 源码对应: sucompat.c -> int ksu_handle_faccessat(...)
 target_file="fs/open.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [5/7] Hooking fs/open.c ... "
@@ -267,7 +260,6 @@ fi
 # -------------------------------------------------------------------------
 # [6. Setuid Hook] (权限切换)
 # -------------------------------------------------------------------------
-# 源码对应: setuid_hook.c -> int ksu_handle_setresuid(...)
 target_file="kernel/sys.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [6/7] Hooking kernel/sys.c ... "
@@ -285,7 +277,6 @@ fi
 # -------------------------------------------------------------------------
 # [7. Reboot Hook] (卸载挂载点)
 # -------------------------------------------------------------------------
-# 源码对应: supercalls.c -> int ksu_handle_sys_reboot(...)
 target_file="kernel/reboot.c"
 if [ -f "$target_file" ]; then
     echo -ne "   -> [7/7] Hooking kernel/reboot.c ... "
@@ -300,8 +291,7 @@ else
     echo -e "${R}⚠️ 警告: kernel/reboot.c 未找到，跳过 Reboot Hook${N}"
 fi
 
-echo -e "${G}🎉 SukiSU-Ultra 全量 Hook 注入完成！(已根据源码 ksud.c/sucompat.c 严格校对签名)${N}"
-
+echo -e "${G}🎉 SukiSU-Ultra 全量 Hook 注入完成！(已修复结构体可见性)${N}"
 
 # ==================== [Step 3.5: SukiSU 深度适配 (纯净动态链接版)] ====================
 echo -e "\033[0;34m🔧 [3.5/6] 正在执行 SukiSU 深度适配 (0侵入内核模式)...\033[0m"
