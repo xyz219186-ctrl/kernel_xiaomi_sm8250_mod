@@ -303,75 +303,85 @@ fi
 echo -e "${G}🎉 SukiSU-Ultra 全量 Hook 注入完成！(已根据源码 ksud.c/sucompat.c 严格校对签名)${N}"
 
 
-# ==================== [Step 3.5: SukiSU 逻辑深度适配 (安全修正版)] ====================
-echo -e "\033[0;34m🔧 [3.5/6] 正在执行 SukiSU 逻辑深度适配 (参考 ReSukiSU 方案)...\033[0m"
+# ==================== [Step 3.5: SukiSU 深度适配 (纯净动态链接版)] ====================
+echo -e "\033[0;34m🔧 [3.5/6] 正在执行 SukiSU 深度适配 (0侵入内核模式)...\033[0m"
 
-# 1. 强制 drivers/Makefile 包含 kernelsu (必须有)
+# 1. 修正 Drivers Makefile
+# 只确保 kernelsu 被编译，不碰其他东西
 DRIVERS_MAKEFILE="drivers/Makefile"
 if [ -f "$DRIVERS_MAKEFILE" ]; then
     sed -i '/kernelsu/d' "$DRIVERS_MAKEFILE"
     echo "obj-y += kernelsu/" >> "$DRIVERS_MAKEFILE"
 fi
 
-# 2. 移除 susfs 编译指令 (防止 No rule 报错)
-# 既然你不需要编译 susfs 源码，就必须把这一行干掉
-if [ -f "drivers/Makefile" ]; then
-    sed -i '/susfs/d' "drivers/Makefile"
-fi
-if [ -f "fs/Makefile" ]; then
-    sed -i '/susfs/d' "fs/Makefile"
-fi
-
-# 3. 深度修正 rules.c (核心逻辑)
+# 2. 适配 rules.c (这是唯一的战场)
 RULES_FILE="drivers/kernelsu/selinux/rules.c"
 if [ -f "$RULES_FILE" ]; then
-    echo "   -> 正在修正 SukiSU rules.c (注入兼容代码)..."
+    echo "   -> 正在注入动态符号查找逻辑..."
 
-    # [操作 A] 重写 get_policydb 函数
-    # 原理：参考 ReSukiSU，直接引用内核全局变量 policydb，绕过 selinux_state 检查
-    
-    # 1. 先声明外部变量 (插在头部 include 之后)
-    sed -i '/#include "xfrm.h"/a \\n/* KSU_COMPAT: 4.19 Kernel Adaption */\nextern struct policydb policydb;' "$RULES_FILE"
+    # [2.1] 引入头文件 (插在 types.h 后面，确保在文件顶部)
+    if ! grep -q "linux/kallsyms.h" "$RULES_FILE"; then
+        sed -i '/#include <linux\/types.h>/a #include <linux/kallsyms.h>' "$RULES_FILE"
+    fi
 
-    # 2. 删除旧的 get_policydb 函数体 (利用 sed 区间删除)
+    # [2.2] 清理旧函数 (删掉 SukiSU 原生那些会导致报错的代码)
+    # 删除 reset_avc_cache (因为它参数不对，且引用了不存在的符号)
+    sed -i '/static void reset_avc_cache(void)/,/^}/d' "$RULES_FILE"
+    # 删除 get_policydb (因为它引用了可能不可见的 policydb)
     sed -i '/static struct policydb \*get_policydb(void)/,/^}/d' "$RULES_FILE"
 
-    # 3. 注入新的 get_policydb 实现 (最简易版)
-    sed -i '/#define ALL NULL/a \
-static struct policydb *get_policydb(void)\
-{\
-    return &policydb;\
-}' "$RULES_FILE"
+    # [2.3] 准备新代码块 (写入临时文件)
+    # 逻辑：完全依赖 kallsyms_lookup_name 在运行时寻找函数地址
+    cat > rules_patch.c <<EOF
 
-    # [操作 B] 重写 reset_avc_cache 函数
-    # 原理：ReSukiSU 逻辑，强制使用单参数调用，防止 Error 2
+/* KSU_ADAPTER: Pure Dynamic Resolve */
+typedef int (*avc_ss_reset_t)(u32 seqno);
+
+static void reset_avc_cache(void)
+{
+    static avc_ss_reset_t sym_avc_ss_reset = NULL;
     
-    # 1. 删除旧的声明 (avc_ss_reset)
-    sed -i '/extern int avc_ss_reset/d' "$RULES_FILE"
+    // 动态查找内核符号 (即使它是 static 的，只要 CONFIG_KALLSYMS_ALL=y 就能找到)
+    if (!sym_avc_ss_reset) {
+        sym_avc_ss_reset = (avc_ss_reset_t)kallsyms_lookup_name("avc_ss_reset");
+    }
+
+    // 只有找到了才调用，防止空指针崩溃
+    if (sym_avc_ss_reset) {
+        sym_avc_ss_reset(0); // 强制单参数调用
+    } else {
+        // 如果找不到符号，打印个警告 (虽然没什么用，但比崩溃强)
+        pr_warn("KernelSU: avc_ss_reset symbol not found!\n");
+    }
     
-    # 2. 注入正确声明 (单参数)
-    sed -i '/static int get_object/i \
-/* KSU_COMPAT: Force single argument for 4.19 */\
-extern int avc_ss_reset(u32 seqno);' "$RULES_FILE"
+    selnl_notify_policyload(0);
+    selinux_xfrm_notify_policyload();
+}
 
-    # 3. 删除旧的 reset_avc_cache 函数体
-    sed -i '/static void reset_avc_cache(void)/,/^}/d' "$RULES_FILE"
+static struct policydb *get_policydb(void)
+{
+    static struct policydb *sym_policydb = NULL;
+    
+    if (!sym_policydb) {
+        sym_policydb = (struct policydb *)kallsyms_lookup_name("policydb");
+    }
+    
+    return sym_policydb;
+}
+EOF
 
-    # 4. 注入新的 reset_avc_cache 实现
-    # 注意：这里我们直接用 0 作为参数，且保留 selinux_xfrm_notify_policyload
-    sed -i '/extern int avc_ss_reset(u32 seqno);/a \
-static void reset_avc_cache(void)\
-{\
-    avc_ss_reset(0);\
-    selnl_notify_policyload(0);\
-    selinux_xfrm_notify_policyload();\
-}' "$RULES_FILE"
-
-    echo "      -> rules.c 适配完成 (已重写关键函数)"
+    # [2.4] 将新代码插入到文件头部
+    # 插在 #include <linux/kallsyms.h> 后面，确保定义在调用之前
+    sed -i '/#include <linux\/kallsyms.h>/r rules_patch.c' "$RULES_FILE"
+    rm -f rules_patch.c
+    
+    echo "   -> 动态链接代码已注入"
 fi
 
-echo -e "\033[0;32m✅ SukiSU 逻辑适配完成！(无内核侵入)\033[0m"
+# 注意：这里我们完全删除了对 security/selinux/avc.c 的任何修改
+# 相信你的 CONFIG_KALLSYMS_ALL=y 能搞定一切！
 
+echo -e "\033[0;32m✅ SukiSU 适配完成！(无痕模式)\033[0m"
 # ==================== [Step 4: SukiSU 源码适配] ====================
 echo "💉 [4/6] 执行 SukiSU 源码编译适配..."
 
