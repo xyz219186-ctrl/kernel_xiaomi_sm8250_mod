@@ -525,69 +525,104 @@ if ! grep -q "CONFIG_KSU=y" out/.config; then
 fi
 
 
-# ==================== [Step 6: 编译、KPM修补与打包] ====================
-echo "🚀 [6/6] 启动多核编译..."
+# ==================== [Step 6: 编译、修补与打包 (可视化增强版)] ====================
+echo -e "\033[0;34m🚀 [6/6] 启动最终编译流程 (含 KPM 修补 + 桥接核查)...\033[0m"
 
-# 1. 正常编译 (保留标准输出，让你能看到编译进度)
+# --- 1. 执行编译 ---
+# 保留标准输出，这样你能看到进度条，不至于对着黑屏发呆
 make $MAKE_ARGS -j$(nproc)
 
-# 2. 检查结果
+# --- 2. 核心产物检查 ---
 if [ -f "out/arch/arm64/boot/Image" ]; then
-    echo -e "\033[0;32m✅ [编译成功] Image 已生成\033[0m"
+    echo -e "\033[0;32m✅ [编译成功] 内核镜像 Image 已顺利生成！\033[0m"
     
-    # --- [KPM 二进制修补] ---
-    # 只要开启了 KPM，就自动执行，不多嘴
+    # --- [3. KPM 二进制修补 (SukiSU 核心)] ---
+    # 自动检测 .config 是否开启了 KPM，开了才修补，没开自动跳过
     if grep -q "CONFIG_KPM=y" out/.config; then
+        echo -e "\033[0;33m🔧 [KPM] 检测到 KPM 配置已开启，准备执行修补...\033[0m"
+        
         cd out/arch/arm64/boot/ || exit 1
         
-        # 只有当没有工具时才下载
+        # [3.1] 下载工具
         if [ ! -f "patch_linux" ]; then
+            echo "   ⬇️ 正在下载修补工具 (patch_linux)..."
             wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.2/patch_linux
         fi
         
+        # [3.2] 执行修补
         if [ -f "patch_linux" ]; then
             chmod +x patch_linux
-            ./patch_linux > /dev/null 2>&1 # 静默执行
+            ./patch_linux > /dev/null 2>&1 # 静默执行，只看结果
             
+            # [3.3] 验证修补结果
             if [ -f "oImage" ]; then
-                echo "   -> [KPM] Binary Patch Applied."
+                echo -e "\033[0;32m   ✅ [KPM成功] 补丁注入完成！正在替换内核镜像...\033[0m"
                 mv Image Image.bak
                 mv oImage Image
                 rm -f patch_linux
             else
-                echo -e "\033[0;31m   ❌ [KPM] Patch failed (no oImage).\033[0m"
+                echo -e "\033[0;31m   ❌ [KPM失败] 工具运行了但没吐出新镜像 (oImage 未生成)。\033[0m"
+                echo -e "\033[0;33m      ⚠️ 将使用原版 Image 打包 (Root 功能可能受限)。\033[0m"
             fi
+        else
+            echo -e "\033[0;31m   ❌ [下载失败] 无法获取 patch_linux 工具，跳过修补！\033[0m"
         fi
         cd - > /dev/null
+    else
+        echo -e "\033[0;36mℹ️ [提示] KPM 未开启，跳过二进制修补步骤。\033[0m"
     fi
 
-    # --- [核心变量核查 (只报结果，不废话)] ---
+    # --- [4. 桥接模式生效核查 (让你可以放心刷入)] ---
+    # 这里只检查 Step 3.5 是否生效，如果不生效，刷了也没 Root
     SYSTEM_MAP="out/System.map"
     if [ -f "$SYSTEM_MAP" ]; then
-        # 只要确认 Step 3.5 的变量导出成功了，就绝对没问题
+        echo "🔎 [核查] 正在检查变量导出状态..."
+        
+        # 查变量 ksu_selinux_avc_ptr
         if grep -q "ksu_selinux_avc_ptr" "$SYSTEM_MAP"; then
-            echo -e "\033[0;32m   ✅ [Check] Symbol 'ksu_selinux_avc_ptr' exported.\033[0m"
+            echo -e "\033[0;32m   ✅ [变量导出] 成功找到 'ksu_selinux_avc_ptr' (Root 稳了)\033[0m"
         else
-            echo -e "\033[0;31m   ❌ [Check] Symbol export FAILED.\033[0m"
+            echo -e "\033[0;31m   ❌ [严重警告] 未找到 'ksu_selinux_avc_ptr'！Step 3.5 可能未生效！\033[0m"
+        fi
+
+        # 查函数 avc_ss_reset (SukiSU 需要它是全局的)
+        if grep "avc_ss_reset" "$SYSTEM_MAP" | grep -q -v " t "; then
+             echo -e "\033[0;32m   ✅ [函数解锁] 'avc_ss_reset' 已解除私有限制。\033[0m"
+        else
+             echo -e "\033[0;33m   ⚠️ [注意] 'avc_ss_reset' 仍是局部符号 (ReSukiSU 可忽略，SukiSU 请留意)。\033[0m"
         fi
     fi
 
-    # --- [打包流程] ---
-    echo "📦 Packing AnyKernel3..."
+    # --- [5. 打包 AnyKernel3] ---
+    echo "📦 [打包] 正在生成刷机包..."
+    
+    # 清理旧环境
     rm -rf anykernel && git clone https://github.com/liyafe1997/AnyKernel3 -b kona --depth=1 anykernel > /dev/null 2>&1
     rm -rf anykernel/kernels/ && mkdir -p anykernel/kernels/
     
+    # 拷贝核心 (Image 此时已经是修补过的了)
     cp out/arch/arm64/boot/Image anykernel/kernels/
+    
+    # 合并 DTB (Alioth/Kona 必需步骤)
+    echo "   📄 正在合并 DTB 文件..."
     find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > anykernel/kernels/dtb
     
+    # 生成文件名 (带日期和 KPM 标识)
     cd anykernel
-    ZIP_NAME="Kernel_Alioth_ReSukiSU_KPM_$(date +'%Y%m%d_%H%M%S').zip"
+    KPM_TAG=""
+    if grep -q "CONFIG_KPM=y" ../out/.config; then KPM_TAG="_KPM"; fi
+    ZIP_NAME="Kernel_${TARGET_DEVICE}_ReSukiSU${KPM_TAG}_$(date +'%Y%m%d_%H%M%S').zip"
+    
+    # 压缩
     zip -q -r9 "../$ZIP_NAME" ./* -x .git .gitignore
     cd ..
     
-    echo -e "\033[0;32m🎉 Done: $ZIP_NAME\033[0m"
+    echo "--------------------------------------------------------"
+    echo -e "\033[0;32m🎉 [大功告成] 刷机包已生成：\033[0m"
+    echo -e "\033[0;32m   👉 ./$ZIP_NAME\033[0m"
+    echo -e "\033[0;36m💡 提示：此包已包含 变量导出 + KPM修补，理论上开机即用。\033[0m"
 else
-    echo -e "\033[0;31m❌ Build Failed!\033[0m"
+    echo -e "\033[0;31m❌ [致命错误] 编译失败！Image 文件未生成。\033[0m"
+    echo -e "\033[0;31m   -> 请向上翻阅日志查看具体报错原因。\033[0m"
     exit 1
-fi
 fi
