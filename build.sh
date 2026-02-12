@@ -293,133 +293,94 @@ fi
 
 echo -e "${G}🎉 SukiSU-Ultra 全量 Hook 注入完成！(已修复结构体可见性)${N}"
 
-# ==================== [Step 3.5: 饱和式容错扫描版 (Range=1024)] ====================
-echo -e "\033[0;34m🔧 [3.5/6] 注入饱和容错扫描 (Range=1024 + Fault-tolerant)...\033[0m"
+# ==================== [Step 3.5: 变量桥接与链接修复 (双导出增强版)] ====================
+echo "🔧 [3.5/6] 正在执行变量桥接与冲突修复 (增强版)..."
 
-# 1. 修正 Drivers Makefile
+# 1. 强制 drivers/Makefile 包含 kernelsu
 DRIVERS_MAKEFILE="drivers/Makefile"
 if [ -f "$DRIVERS_MAKEFILE" ]; then
     sed -i '/kernelsu/d' "$DRIVERS_MAKEFILE"
     echo "obj-y += kernelsu/" >> "$DRIVERS_MAKEFILE"
 fi
 
-# 2. 修正 rules.c
-RULES_FILE="drivers/kernelsu/selinux/rules.c"
-if [ -f "$RULES_FILE" ]; then
-    echo "   -> 执行分离式暴力注入 (防止 ALL/ksu_rules 报错)..."
-
-    # [A] 暴力清理：移除旧干扰
-    sed -i '/extern.*avc_ss_reset/d' "$RULES_FILE"
-    sed -i '/extern.*selnl_notify_policyload/d' "$RULES_FILE"
-    sed -i '/static void reset_avc_cache(void)/,/^}/d' "$RULES_FILE"
-    sed -i '/static struct policydb \*get_policydb(void)/,/^}/d' "$RULES_FILE"
-
-    # [B] 注入 Part 1：分离声明 (万能钥匙)
-    cat > rules_head.c <<EOF
-/* [KSU_FIX] Part 1: Forward Declarations */
-#include <linux/kallsyms.h>
-#include <linux/uaccess.h> 
-#include <linux/slab.h>
-
-struct policydb;
-static struct policydb *get_policydb(void);
-static void reset_avc_cache(void);
-EOF
-    # 插入到 types.h 后面
-    if grep -q "#include <linux/types.h>" "$RULES_FILE"; then
-        sed -i '/#include <linux\/types.h>/r rules_head.c' "$RULES_FILE"
-    else
-        sed -i '0,/#include/s//#include\n#include <linux\/types.h>/' "$RULES_FILE"
-        sed -i '/#include <linux\/types.h>/r rules_head.c' "$RULES_FILE"
+# 2. 桥接 Policydb
+SERVICES_FILE="security/selinux/ss/services.c"
+if [ -f "$SERVICES_FILE" ]; then
+    if ! grep -q "linux/export.h" "$SERVICES_FILE"; then
+        sed -i '/#include <linux\/kernel.h>/a #include <linux/export.h>' "$SERVICES_FILE"
     fi
-    rm -f rules_head.c
+    if ! grep -q "ksu_policydb_ptr" "$SERVICES_FILE"; then
+        cat >> "$SERVICES_FILE" <<EOF
 
-    # [C] 注入 Part 2：具体实现 (你要求的“不可读即跳过”逻辑)
-    cat > rules_body.c <<EOF
-
-/* [KSU_FIX] Part 2: Implementation (Fault-tolerant Scanner) */
-typedef int (*avc_ss_reset_t)(void *avc, u32 seqno);
-typedef void (*notify_t)(u32 seqno);
-
-static void *find_ptr_via_state(void)
-{
-    void *state_ptr = (void *)kallsyms_lookup_name("selinux_state");
-    void **cursor;
-    int i;
-    unsigned int val = 0;
-
-    if (!state_ptr) return NULL;
-    cursor = (void **)state_ptr;
-
-    /* 你的核心要求：扫描 1024 次，失败则继续，全部失败则跳过 */
-    for (i = 0; i < 1024; i++) {
-        void *candidate = cursor[i];
-        
-        // 1. 快速过滤非法地址 ( NULL 或低位地址直接跳过)
-        if (!candidate || (unsigned long)candidate < 0xffff000000000000) {
-            continue; 
-        }
-
-        /* 2. 深度安全探测 (这是你的“发现不可读则跳过”) */
-        // probe_kernel_read 如果返回非 0，说明该内存页不可访问
-        if (probe_kernel_read(&val, candidate, sizeof(unsigned int)) != 0) {
-            continue; // 这里就是你的逻辑：不可读，继续看下一个，绝不崩溃
-        }
-
-        // 3. 特征指纹匹配
-        if (val == 512) {
-            return candidate; // 成功捕获，立即返回
-        }
-    }
-    
-    // 扫完 1024 还没结果，体面退出
-    return NULL;
-}
-
-static struct policydb *get_policydb(void)
-{
-    static struct policydb *sym_policydb = NULL;
-    if (!sym_policydb) sym_policydb = (struct policydb *)kallsyms_lookup_name("policydb");
-    return sym_policydb;
-}
-
-static void reset_avc_cache(void)
-{
-    static avc_ss_reset_t sym_avc_ss_reset = NULL;
-    static void *sym_selinux_avc = NULL;
-    static notify_t sym_selnl_notify = NULL;
-    static int scan_done = 0;
-    
-    if (!scan_done) {
-        sym_avc_ss_reset = (avc_ss_reset_t)kallsyms_lookup_name("avc_ss_reset");
-        sym_selinux_avc = find_ptr_via_state(); // 这里执行 1024 次容错扫描
-        scan_done = 1;
-    }
-
-    // 这里就是你的要求：只有扫到了才调，扫不到就当作无事发生，开机！
-    if (sym_avc_ss_reset && sym_selinux_avc) {
-        sym_avc_ss_reset(sym_selinux_avc, 0);
-    }
-    
-    if (!sym_selnl_notify) sym_selnl_notify = (notify_t)kallsyms_lookup_name("selnl_notify_policyload");
-    if (sym_selnl_notify) sym_selnl_notify(0);
-
-    selinux_xfrm_notify_policyload();
-}
+/* KSU Bridge */
+struct policydb *ksu_policydb_ptr = &selinux_ss.policydb;
+EXPORT_SYMBOL(ksu_policydb_ptr);
 EOF
-
-    # 插入到 xfrm.h 或 sepolicy.h 后完成分离逻辑
-    if grep -q "xfrm.h" "$RULES_FILE"; then
-        sed -i '/include.*xfrm.h/r rules_body.c' "$RULES_FILE"
-    elif grep -q "sepolicy.h" "$RULES_FILE"; then
-        sed -i '/include.*sepolicy.h/r rules_body.c' "$RULES_FILE"
-    else
-        sed -i '50r rules_body.c' "$RULES_FILE"
     fi
-    rm -f rules_body.c
 fi
 
-echo -e "\033[0;32m✅ 容错扫描注入完成！(1024范围 + 编译修复 + 安全防崩)\033[0m"
+# 3. 桥接 AVC (这里增加了针对函数的修复！)
+AVC_FILE="security/selinux/avc.c"
+if [ -f "$AVC_FILE" ]; then
+    echo "   -> 处理 avc.c (导出变量 + 公开函数)..."
+    
+    if ! grep -q "linux/export.h" "$AVC_FILE"; then
+        sed -i '/#include <linux\/types.h>/a #include <linux/export.h>' "$AVC_FILE"
+    fi
+
+    # [A] 导出变量指针
+    if ! grep -q "ksu_selinux_avc_ptr" "$AVC_FILE"; then
+        cat >> "$AVC_FILE" <<EOF
+
+/* KSU Bridge */
+struct selinux_avc *ksu_selinux_avc_ptr = &selinux_avc;
+EXPORT_SYMBOL(ksu_selinux_avc_ptr);
+EOF
+    fi
+
+    # [B] 【关键修改】强制公开 avc_ss_reset 函数
+    # 1. 使用正则把 static int avc_ss_reset 变成 int avc_ss_reset
+    sed -i 's/static[[:space:]]*int[[:space:]]*avc_ss_reset/int avc_ss_reset/g' "$AVC_FILE"
+    
+    # 2. 显式导出它，让 SukiSU 闭嘴
+    if ! grep -q "EXPORT_SYMBOL(avc_ss_reset)" "$AVC_FILE"; then
+        echo "EXPORT_SYMBOL(avc_ss_reset);" >> "$AVC_FILE"
+    fi
+fi
+
+# 4. 适配 rules.c
+RULES_FILE="drivers/kernelsu/selinux/rules.c"
+if [ -f "$RULES_FILE" ]; then
+    echo "   -> 修复 drivers/kernelsu/selinux/rules.c ..."
+    
+    # 增加头文件
+    sed -i '1i #include <linux/export.h>' "$RULES_FILE"
+
+    # 替换 get_policydb
+    if grep -q "static struct policydb \*get_policydb(void)" "$RULES_FILE"; then
+       sed -i '/static struct policydb \*get_policydb(void)/,/^}/c\
+extern struct policydb *ksu_policydb_ptr;\
+static struct policydb *get_policydb(void)\
+{\
+    return ksu_policydb_ptr;\
+}' "$RULES_FILE"
+    fi
+    
+    # 替换 reset_avc_cache
+    if grep -q "static void reset_avc_cache(void)" "$RULES_FILE"; then
+        sed -i '/static void reset_avc_cache(void)/,/^}/c\
+extern struct selinux_avc *ksu_selinux_avc_ptr;\
+extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);\
+static void reset_avc_cache(void)\
+{\
+    if (ksu_selinux_avc_ptr) avc_ss_reset(ksu_selinux_avc_ptr, 0);\
+    selnl_notify_policyload(0);\
+    selinux_xfrm_notify_policyload();\
+}' "$RULES_FILE"
+    fi
+fi
+
+echo "   ✅ 桥接与修复全部完成！(函数权限已解锁)"
 
 # ==================== [Step 4: SukiSU 源码适配] ====================
 echo "💉 [4/6] 执行 SukiSU 源码编译适配..."
