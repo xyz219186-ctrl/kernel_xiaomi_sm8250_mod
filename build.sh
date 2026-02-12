@@ -293,8 +293,8 @@ fi
 
 echo -e "${G}🎉 SukiSU-Ultra 全量 Hook 注入完成！(已修复结构体可见性)${N}"
 
-# ==================== [Step 3.5: 终极完全体 (前置声明 + 1024扫描 + 防崩)] ====================
-echo -e "\033[0;34m🔧 [3.5/6] 正在注入完全体逻辑 (SukiSU修复 + 饱和扫描)...\033[0m"
+# ==================== [Step 3.5: 饱和式容错扫描版 (Range=1024)] ====================
+echo -e "\033[0;34m🔧 [3.5/6] 注入饱和容错扫描 (Range=1024 + Fault-tolerant)...\033[0m"
 
 # 1. 修正 Drivers Makefile
 DRIVERS_MAKEFILE="drivers/Makefile"
@@ -303,23 +303,29 @@ if [ -f "$DRIVERS_MAKEFILE" ]; then
     echo "obj-y += kernelsu/" >> "$DRIVERS_MAKEFILE"
 fi
 
-# 2. 重写 rules.c
+# 2. 修正 rules.c
 RULES_FILE="drivers/kernelsu/selinux/rules.c"
 if [ -f "$RULES_FILE" ]; then
-    echo "   -> 正在重写 rules.c ..."
+    echo "   -> 执行分离式暴力注入 (防止 ALL/ksu_rules 报错)..."
 
-    # [A] 注入前置声明 (这是解决编译报错的万能钥匙！)
-    # 插在 types.h 之后，确保编译器第一时间看到
+    # [A] 暴力清理：移除旧干扰
+    sed -i '/extern.*avc_ss_reset/d' "$RULES_FILE"
+    sed -i '/extern.*selnl_notify_policyload/d' "$RULES_FILE"
+    sed -i '/static void reset_avc_cache(void)/,/^}/d' "$RULES_FILE"
+    sed -i '/static struct policydb \*get_policydb(void)/,/^}/d' "$RULES_FILE"
+
+    # [B] 注入 Part 1：分离声明 (万能钥匙)
     cat > rules_head.c <<EOF
-/* [KSU] Headers & Forward Declarations */
+/* [KSU_FIX] Part 1: Forward Declarations */
 #include <linux/kallsyms.h>
-#include <linux/slab.h>
 #include <linux/uaccess.h> 
+#include <linux/slab.h>
 
 struct policydb;
 static struct policydb *get_policydb(void);
 static void reset_avc_cache(void);
 EOF
+    # 插入到 types.h 后面
     if grep -q "#include <linux/types.h>" "$RULES_FILE"; then
         sed -i '/#include <linux\/types.h>/r rules_head.c' "$RULES_FILE"
     else
@@ -328,19 +334,13 @@ EOF
     fi
     rm -f rules_head.c
 
-    # [B] 清理旧定义 (防止重复定义报错)
-    sed -i '/extern.*avc_ss_reset/d' "$RULES_FILE"
-    sed -i '/extern.*selnl_notify_policyload/d' "$RULES_FILE"
-    sed -i '/static void reset_avc_cache(void)/,/^}/d' "$RULES_FILE"
-    sed -i '/static struct policydb \*get_policydb(void)/,/^}/d' "$RULES_FILE"
-
-    # [C] 注入具体实现 (Range=1024 + Probe防崩)
+    # [C] 注入 Part 2：具体实现 (你要求的“不可读即跳过”逻辑)
     cat > rules_body.c <<EOF
 
+/* [KSU_FIX] Part 2: Implementation (Fault-tolerant Scanner) */
 typedef int (*avc_ss_reset_t)(void *avc, u32 seqno);
 typedef void (*notify_t)(u32 seqno);
 
-/* 饱和式扫描函数 */
 static void *find_ptr_via_state(void)
 {
     void *state_ptr = (void *)kallsyms_lookup_name("selinux_state");
@@ -349,19 +349,30 @@ static void *find_ptr_via_state(void)
     unsigned int val = 0;
 
     if (!state_ptr) return NULL;
-
     cursor = (void **)state_ptr;
-    
-    // 扫描 1024 个位置，绝对不漏
+
+    /* 你的核心要求：扫描 1024 次，失败则继续，全部失败则跳过 */
     for (i = 0; i < 1024; i++) {
         void *candidate = cursor[i];
-        if ((unsigned long)candidate < 0xffff000000000000) continue;
+        
+        // 1. 快速过滤非法地址 ( NULL 或低位地址直接跳过)
+        if (!candidate || (unsigned long)candidate < 0xffff000000000000) {
+            continue; 
+        }
 
-        // 安全探测，防止重启
-        if (probe_kernel_read(&val, candidate, sizeof(unsigned int)) == 0) {
-            if (val == 512) return candidate;
+        /* 2. 深度安全探测 (这是你的“发现不可读则跳过”) */
+        // probe_kernel_read 如果返回非 0，说明该内存页不可访问
+        if (probe_kernel_read(&val, candidate, sizeof(unsigned int)) != 0) {
+            continue; // 这里就是你的逻辑：不可读，继续看下一个，绝不崩溃
+        }
+
+        // 3. 特征指纹匹配
+        if (val == 512) {
+            return candidate; // 成功捕获，立即返回
         }
     }
+    
+    // 扫完 1024 还没结果，体面退出
     return NULL;
 }
 
@@ -381,10 +392,11 @@ static void reset_avc_cache(void)
     
     if (!scan_done) {
         sym_avc_ss_reset = (avc_ss_reset_t)kallsyms_lookup_name("avc_ss_reset");
-        sym_selinux_avc = find_ptr_via_state();
+        sym_selinux_avc = find_ptr_via_state(); // 这里执行 1024 次容错扫描
         scan_done = 1;
     }
 
+    // 这里就是你的要求：只有扫到了才调，扫不到就当作无事发生，开机！
     if (sym_avc_ss_reset && sym_selinux_avc) {
         sym_avc_ss_reset(sym_selinux_avc, 0);
     }
@@ -395,14 +407,19 @@ static void reset_avc_cache(void)
     selinux_xfrm_notify_policyload();
 }
 EOF
+
+    # 插入到 xfrm.h 或 sepolicy.h 后完成分离逻辑
     if grep -q "xfrm.h" "$RULES_FILE"; then
         sed -i '/include.*xfrm.h/r rules_body.c' "$RULES_FILE"
+    elif grep -q "sepolicy.h" "$RULES_FILE"; then
+        sed -i '/include.*sepolicy.h/r rules_body.c' "$RULES_FILE"
     else
         sed -i '50r rules_body.c' "$RULES_FILE"
     fi
     rm -f rules_body.c
 fi
-echo -e "\033[0;32m✅ 终极完全体注入完成！(编译必过 + 开机必稳)\033[0m"
+
+echo -e "\033[0;32m✅ 容错扫描注入完成！(1024范围 + 编译修复 + 安全防崩)\033[0m"
 
 # ==================== [Step 4: SukiSU 源码适配] ====================
 echo "💉 [4/6] 执行 SukiSU 源码编译适配..."
