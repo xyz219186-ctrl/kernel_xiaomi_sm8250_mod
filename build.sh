@@ -525,51 +525,69 @@ if ! grep -q "CONFIG_KSU=y" out/.config; then
 fi
 
 
-# ==================== [Step 6: 编译、核查与自动打包] ====================
+# ==================== [Step 6: 编译、KPM修补与打包] ====================
 echo "🚀 [6/6] 启动多核编译..."
+
+# 1. 正常编译 (保留标准输出，让你能看到编译进度)
 make $MAKE_ARGS -j$(nproc)
 
-# 1. 检查内核镜像是否生成
+# 2. 检查结果
 if [ -f "out/arch/arm64/boot/Image" ]; then
-    echo -e "\033[0;32m✅ [编译成功] 内核镜像 Image 文件已生成！\033[0m"
+    echo -e "\033[0;32m✅ [编译成功] Image 已生成\033[0m"
     
-    # 2. 扫描模式专用核查 (针对 Static 变量的特殊逻辑)
-    SYSTEM_MAP="out/System.map"
-    if [ -f "$SYSTEM_MAP" ]; then
-        echo "🔎 正在执行扫描模式兼容性核查..."
+    # --- [KPM 二进制修补] ---
+    # 只要开启了 KPM，就自动执行，不多嘴
+    if grep -q "CONFIG_KPM=y" out/.config; then
+        cd out/arch/arm64/boot/ || exit 1
         
-        # 检查 avc_ss_reset (这是扫描器的入口，必须公开)
-        if grep -q "avc_ss_reset" "$SYSTEM_MAP"; then
-            echo -e "\033[0;32m   ✅ [核查通过] 核心函数 'avc_ss_reset' 存在。\033[0m"
-        else
-            echo -e "\033[0;31m   ❌ [异常] 未找到 'avc_ss_reset'，扫描逻辑可能无法触发！\033[0m"
+        # 只有当没有工具时才下载
+        if [ ! -f "patch_linux" ]; then
+            wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.2/patch_linux
         fi
-
-        # 解释为什么不找 selinux_avc
-        echo -e "\033[0;33m   ℹ️ [提示] 当前处于 '饱和扫描模式' (Range=1024)。\033[0m"
-        echo "      无需在符号表中寻找 'selinux_avc'。代码将在开机时自动捕捉特征值 512。"
+        
+        if [ -f "patch_linux" ]; then
+            chmod +x patch_linux
+            ./patch_linux > /dev/null 2>&1 # 静默执行
+            
+            if [ -f "oImage" ]; then
+                echo "   -> [KPM] Binary Patch Applied."
+                mv Image Image.bak
+                mv oImage Image
+                rm -f patch_linux
+            else
+                echo -e "\033[0;31m   ❌ [KPM] Patch failed (no oImage).\033[0m"
+            fi
+        fi
+        cd - > /dev/null
     fi
 
-    # 3. AnyKernel3 打包流程
-    echo "📦 正在生成 AnyKernel3 刷机包..."
-    
-    # 清理并拉取 AnyKernel3
-    rm -rf anykernel && git clone https://github.com/liyafe1997/AnyKernel3 -b kona --depth=1 anykernel
+    # --- [核心变量核查 (只报结果，不废话)] ---
+    SYSTEM_MAP="out/System.map"
+    if [ -f "$SYSTEM_MAP" ]; then
+        # 只要确认 Step 3.5 的变量导出成功了，就绝对没问题
+        if grep -q "ksu_selinux_avc_ptr" "$SYSTEM_MAP"; then
+            echo -e "\033[0;32m   ✅ [Check] Symbol 'ksu_selinux_avc_ptr' exported.\033[0m"
+        else
+            echo -e "\033[0;31m   ❌ [Check] Symbol export FAILED.\033[0m"
+        fi
+    fi
+
+    # --- [打包流程] ---
+    echo "📦 Packing AnyKernel3..."
+    rm -rf anykernel && git clone https://github.com/liyafe1997/AnyKernel3 -b kona --depth=1 anykernel > /dev/null 2>&1
     rm -rf anykernel/kernels/ && mkdir -p anykernel/kernels/
     
-    # 拷贝核心组件
     cp out/arch/arm64/boot/Image anykernel/kernels/
     find out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > anykernel/kernels/dtb
     
-    # 压缩打包
     cd anykernel
-    zip -r9 "../Kernel_Alioth_ReSukiSU_$(date +'%Y%m%d').zip" ./* -x .git .gitignore
+    ZIP_NAME="Kernel_Alioth_ReSukiSU_KPM_$(date +'%Y%m%d_%H%M%S').zip"
+    zip -q -r9 "../$ZIP_NAME" ./* -x .git .gitignore
     cd ..
     
-    echo "--------------------------------------------------------"
-    echo -e "\033[0;32m🎉 刷机包已成功生成：Kernel_Alioth_ReSukiSU_$(date +'%Y%m%d').zip\033[0m"
-    echo -e "\033[0;32m✅ 理论状态：100% 可开机，Root 功能饱和生效。\033[0m"
+    echo -e "\033[0;32m🎉 Done: $ZIP_NAME\033[0m"
 else
-    echo -e "\033[0;31m❌ [致命错误] Image 文件未生成，编译失败！请检查上方日志。\033[0m"
+    echo -e "\033[0;31m❌ Build Failed!\033[0m"
     exit 1
+fi
 fi
